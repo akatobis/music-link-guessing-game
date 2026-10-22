@@ -56,12 +56,20 @@ export function SyncedYouTube({
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<any>(null);
+  // Keep the callback in a ref: the parent re-renders every 200ms (live
+  // timer), so passing the function into effect deps would endlessly destroy
+  // and recreate the player — it could never finish loading.
+  const onEndedRef = useRef<typeof onEnded>(onEnded);
   const snipRef = useRef<number | null>(null); // snippet start (sec, in-video)
   const durationRef = useRef<number>(0);
   const kickTimerRef = useRef<number | null>(null);
   const driftRef = useRef<number | null>(null);
   const [state, setState] = useState<SyncState>("loading");
   const [audioIssue, setAudioIssue] = useState(false);
+
+  useEffect(() => {
+    onEndedRef.current = onEnded;
+  }, [onEnded]);
 
   const serverNow = useCallback(
     () => Date.now() + offsetRef.current,
@@ -184,7 +192,7 @@ export function SyncedYouTube({
             } else if (e.data === YT.PlayerState.ENDED) {
               clearTimers();
               setState("ended");
-              onEnded?.();
+              onEndedRef.current?.();
             } else if (e.data === YT.PlayerState.PAUSED) {
               setAudioIssue(true);
             }
@@ -210,7 +218,8 @@ export function SyncedYouTube({
       }
       playerRef.current = null;
     };
-  }, [videoId, startAtMs, serverNow, clearTimers, onEnded]);
+    // NOTE: onEndedRef (not onEnded) is used inside — deps stay stable.
+  }, [videoId, startAtMs, serverNow, clearTimers]);
 
   const resync = useCallback(() => {
     const p = playerRef.current;
