@@ -16,7 +16,9 @@ import {
   Music2,
   Play,
   RefreshCw,
+  SkipForward,
   Timer,
+  Users,
   Wifi,
   X,
 } from "lucide-react";
@@ -59,7 +61,7 @@ interface LiveState {
   totalRounds: number;
   phaseEndsAt: number | null;
   countdownS: number;
-  windowS: number;
+  maxRoundS: number;
   revealS: number;
   scores: ScoreRow[];
   players: PlayerLite[];
@@ -72,7 +74,6 @@ interface LiveState {
     providerId: string;
     albumId: string | null;
     embedUrl: string;
-    fraction: number;
   } | null;
   songInfo: {
     title: string;
@@ -81,6 +82,7 @@ interface LiveState {
     ownerId: string;
     ownerName: string;
     ownerColor: string;
+    owners: { id: string; name: string; color: string }[];
   } | null;
   isOwner: boolean;
   myAnswer: {
@@ -104,6 +106,8 @@ export default function PlayClient() {
   const [soundOn, setSoundOn] = useState(false);
   const [pendingGuess, setPendingGuess] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [trackEnded, setTrackEnded] = useState(false);
+  const [skipping, setSkipping] = useState(false);
   const offsetRef = useRef(0);
   const [tick, setTick] = useState(() => Date.now());
 
@@ -156,6 +160,11 @@ export default function PlayClient() {
     if (s?.status === "finished") celebrate();
   }, [s?.status]);
 
+  // new round → forget previous track-ended flag
+  useEffect(() => {
+    setTrackEnded(false);
+  }, [s?.roundIndex, s?.status]);
+
   async function answer(guessedId: string) {
     if (!s || s.myAnswer || pendingGuess || !meId) return;
     setPendingGuess(guessedId);
@@ -167,6 +176,15 @@ export default function PlayClient() {
       });
     } catch {
       setPendingGuess(null);
+    }
+  }
+
+  async function showAnswer() {
+    setSkipping(true);
+    try {
+      await fetch("/api/live/skip", { method: "POST" });
+    } finally {
+      setSkipping(false);
     }
   }
 
@@ -281,22 +299,29 @@ export default function PlayClient() {
   const startAtMs =
     s.status === "countdown"
       ? (s.phaseEndsAt ?? now)
-      : (s.phaseEndsAt ?? now) - s.windowS * 1000;
+      : (s.phaseEndsAt ?? now) - s.maxRoundS * 1000;
   const secondsLeft = s.phaseEndsAt
     ? Math.max(0, Math.ceil((s.phaseEndsAt - now) / 1000))
     : 0;
-  const phaseTotal =
-    s.status === "countdown"
-      ? s.countdownS
-      : s.status === "playing"
-        ? s.windowS
-        : s.revealS;
-  const phaseFraction = s.phaseEndsAt
-    ? Math.min(
-        1,
-        Math.max(0, (s.phaseEndsAt - now) / (phaseTotal * 1000)),
-      )
-    : 0;
+  const elapsedS = Math.max(0, Math.floor((now - startAtMs) / 1000));
+  const answerProgress =
+    s.eligible > 0 ? Math.min(1, s.answersCount / s.eligible) : 0;
+  // While the track plays the bar tracks answers, not time.
+  const phaseFraction =
+    s.status === "playing"
+      ? answerProgress
+      : s.phaseEndsAt
+        ? Math.min(
+            1,
+            Math.max(
+              0,
+              (s.phaseEndsAt - now) /
+                ((s.status === "countdown" ? s.countdownS : s.revealS) * 1000),
+            ),
+          )
+        : 0;
+  const waitingFor = Math.max(0, s.eligible - s.answersCount);
+  const iAmDone = Boolean(s.myAnswer) || s.isOwner;
 
   /* ---------------------------------- finished --------------------------------- */
   if (s.status === "finished") {
@@ -432,12 +457,17 @@ export default function PlayClient() {
           <span className="text-white/25">/ {pad(s.totalRounds)}</span>
         </div>
         <div className="flex items-center gap-2.5 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-semibold text-white/70">
-          <Timer className="size-4 text-neon" />
-          {s.status === "countdown"
-            ? "старт"
-            : s.status === "playing"
-              ? `${secondsLeft}с`
-              : "разгадка"}
+          {s.status === "playing" ? (
+            <>
+              <Users className="size-4 text-aqua" />
+              ответили {s.answersCount} / {s.eligible}
+            </>
+          ) : (
+            <>
+              <Timer className="size-4 text-neon" />
+              {s.status === "countdown" ? "старт" : `разгадка · ${secondsLeft}с`}
+            </>
+          )}
         </div>
       </div>
       <div className="mb-7 h-1.5 overflow-hidden rounded-full bg-white/8">
@@ -512,10 +542,10 @@ export default function PlayClient() {
                 <SyncedYouTube
                   key={s.song.id}
                   videoId={s.song.providerId}
-                  fraction={s.song.fraction}
                   startAtMs={startAtMs}
                   offsetRef={offsetRef}
                   accent={meScore?.color ?? "#8B5CF6"}
+                  onEnded={() => setTrackEnded(true)}
                 />
               ) : (
                 <NativeAudioEmbed
@@ -528,20 +558,16 @@ export default function PlayClient() {
 
             {/* answers zone */}
             <div className="relative mt-6 border-t border-white/8 pt-6">
-              {s.isOwner ? (
-                <div className="flex flex-col items-center gap-2 py-4 text-center">
-                  <EyeOff className="size-6 text-white/40" />
-                  <p className="font-display text-lg font-bold">
-                    Тс-с-с… это твой трек!
-                  </p>
-                  <p className="max-w-xs text-sm text-white/50">
-                    Наслаждайся и держи покерфейс — очки за этот раунд тебе не
-                    нужны
-                  </p>
-                </div>
-              ) : s.myAnswer ? (
-                <div className="flex flex-col items-center gap-2 py-4 text-center">
-                  {s.myAnswer.correct ? (
+              {iAmDone ? (
+                <div className="flex flex-col items-center gap-3 py-2 text-center">
+                  {s.isOwner ? (
+                    <>
+                      <EyeOff className="size-6 text-white/40" />
+                      <p className="font-display text-lg font-bold">
+                        Тс-с-с… это твой трек!
+                      </p>
+                    </>
+                  ) : s.myAnswer?.correct ? (
                     <span className="flex items-center gap-2 rounded-full bg-lime/15 px-5 py-2.5 font-display text-lg font-bold text-lime">
                       <Check className="size-5" /> Верно! +{s.myAnswer.points}
                     </span>
@@ -550,9 +576,44 @@ export default function PlayClient() {
                       <X className="size-5" /> Мимо
                     </span>
                   )}
-                  <p className="text-xs text-white/40">
-                    ответили {s.answersCount} / {s.eligible} · разгадка скоро
-                  </p>
+
+                  {waitingFor > 0 ? (
+                    <div className="flex flex-col items-center gap-2">
+                      <p className="flex items-center gap-2 text-sm text-white/55">
+                        <Equalizer active color="var(--color-aqua)" bars={3} />
+                        Музыка играет — ждём ещё{" "}
+                        <span className="font-bold text-white">
+                          {waitingFor}
+                        </span>{" "}
+                        {waitingFor === 1 ? "игрока" : "игроков"}
+                      </p>
+                      <p className="text-xs text-white/35">
+                        раунд закончится, как только ответят все
+                        {trackEnded && " · трек уже доиграл"}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={showAnswer}
+                        disabled={skipping}
+                        className={`mt-1 flex items-center gap-2 rounded-full px-5 py-2.5 text-xs font-bold transition-all ${
+                          trackEnded
+                            ? "animate-glow-pulse bg-white text-ink hover:scale-105"
+                            : "border border-white/15 bg-white/5 text-white/60 hover:bg-white/10"
+                        }`}
+                      >
+                        {skipping ? (
+                          <Loader2 className="size-3.5 animate-spin" />
+                        ) : (
+                          <SkipForward className="size-3.5" />
+                        )}
+                        Не ждать — показать ответ
+                      </button>
+                    </div>
+                  ) : (
+                    <p className="text-xs text-white/40">
+                      все ответили · показываю разгадку…
+                    </p>
+                  )}
                 </div>
               ) : (
                 <>
@@ -573,7 +634,9 @@ export default function PlayClient() {
                       ))}
                   </div>
                   <p className="mt-4 text-center text-xs text-white/35">
-                    Чем быстрее ответишь, тем больше очков · до +150
+                    Трек играет целиком · чем быстрее ответишь, тем больше
+                    очков (до +150) · идёт{" "}
+                    {Math.floor(elapsedS / 60)}:{pad(elapsedS % 60)}
                   </p>
                 </>
               )}
@@ -635,15 +698,32 @@ export default function PlayClient() {
                 <div className="truncate text-sm text-white/50">
                   {s.songInfo.artist || "исполнитель неизвестен"}
                 </div>
-                <div className="mt-1.5 text-sm">
-                  Это трек{" "}
-                  <span
-                    className="font-display font-bold"
-                    style={{ color: s.songInfo.ownerColor }}
-                  >
-                    {s.songInfo.ownerName}
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
+                  <span className="text-white/50">
+                    {s.songInfo.owners.length > 1
+                      ? "Общий трек —"
+                      : "Это трек"}
                   </span>
+                  {s.songInfo.owners.map((o) => (
+                    <span
+                      key={o.id}
+                      className="flex items-center gap-1.5 rounded-full px-2.5 py-1 font-display text-xs font-bold"
+                      style={{ background: `${o.color}22`, color: o.color }}
+                    >
+                      <span
+                        className="size-2 rounded-full"
+                        style={{ background: o.color }}
+                      />
+                      {o.name}
+                    </span>
+                  ))}
                 </div>
+                {s.songInfo.owners.length > 1 && (
+                  <div className="mt-2 flex items-center gap-1.5 text-xs font-semibold text-aqua">
+                    <Users className="size-3.5" />
+                    Совпадение вкусов! Засчитан любой из них
+                  </div>
+                )}
               </div>
               {s.song && (
                 <ProviderChip provider={s.song.provider as MusicProvider} />

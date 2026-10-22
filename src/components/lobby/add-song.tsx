@@ -91,7 +91,9 @@ export function AddSongForm({
         setError(
           j.error === "songs_limit"
             ? "У этого игрока уже 10 треков"
-            : "Не удалось сохранить трек",
+            : j.error === "duplicate_own"
+              ? "Этот трек уже есть в твоём списке"
+              : "Не удалось сохранить трек",
         );
         return;
       }

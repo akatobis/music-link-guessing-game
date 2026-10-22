@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { db } from "@/db";
 import { players, songs } from "@/db/schema";
 import {
@@ -60,12 +60,23 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "unsupported" }, { status: 422 });
   }
 
-  const [{ count }] = await db
-    .select({ count: sql<number>`count(*)::int` })
+  const mySongs = await db
+    .select()
     .from(songs)
     .where(eq(songs.playerId, playerId));
-  if (count >= MAX_SONGS_PER_PLAYER) {
+
+  if (mySongs.length >= MAX_SONGS_PER_PLAYER) {
     return NextResponse.json({ error: "songs_limit" }, { status: 422 });
+  }
+
+  // Same track twice in one playlist makes no sense. Duplicates across
+  // different players are allowed on purpose (they become a shared round).
+  const alreadyMine = mySongs.some(
+    (s) =>
+      s.provider === parsed.provider && s.providerId === parsed.providerId,
+  );
+  if (alreadyMine) {
+    return NextResponse.json({ error: "duplicate_own" }, { status: 409 });
   }
 
   const meta = await resolveMetadata(parsed);

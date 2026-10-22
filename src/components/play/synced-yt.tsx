@@ -35,24 +35,24 @@ export function loadYouTubeApi(): Promise<void> {
   return ytPromise;
 }
 
-type SyncState = "loading" | "queued" | "playing" | "error";
+type SyncState = "loading" | "queued" | "playing" | "ended" | "error";
 
 /**
- * Hidden YouTube player that starts a deterministic snippet exactly at
- * `startAtMs` (server epoch) and keeps correcting drift against it.
+ * Hidden YouTube player that starts the track at `startAtMs` (server epoch)
+ * and plays it through to the end, correcting drift against the shared clock.
  */
 export function SyncedYouTube({
   videoId,
-  fraction,
   startAtMs,
   offsetRef,
   accent,
+  onEnded,
 }: {
   videoId: string;
-  fraction: number;
   startAtMs: number;
   offsetRef: MutableRefObject<number>;
   accent: string;
+  onEnded?: () => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<any>(null);
@@ -92,8 +92,8 @@ export function SyncedYouTube({
           const dur = player.getDuration?.() ?? 0;
           if (dur > 0) {
             durationRef.current = dur;
-            const maxStart = Math.max(0, dur - 30);
-            snipRef.current = Math.min(fraction * dur, maxStart);
+            // Full track: always start from the very beginning.
+            snipRef.current = 0;
             return true;
           }
         } catch {
@@ -182,7 +182,9 @@ export function SyncedYouTube({
             } else if (e.data === YT.PlayerState.PLAYING) {
               setState("playing");
             } else if (e.data === YT.PlayerState.ENDED) {
-              setState("queued");
+              clearTimers();
+              setState("ended");
+              onEnded?.();
             } else if (e.data === YT.PlayerState.PAUSED) {
               setAudioIssue(true);
             }
@@ -208,7 +210,7 @@ export function SyncedYouTube({
       }
       playerRef.current = null;
     };
-  }, [videoId, fraction, startAtMs, serverNow, clearTimers]);
+  }, [videoId, startAtMs, serverNow, clearTimers, onEnded]);
 
   const resync = useCallback(() => {
     const p = playerRef.current;
@@ -240,12 +242,13 @@ export function SyncedYouTube({
         <span className="text-sm text-white/50">
           {state === "loading" && "Подключаюсь к YouTube…"}
           {state === "queued" && !audioIssue && "Трек вот-вот начнётся…"}
-          {state === "playing" && !audioIssue && "Играет во всех браузерах"}
+          {state === "playing" && !audioIssue && "Играет у всех одновременно"}
+          {state === "ended" && !audioIssue && "Трек доиграл до конца"}
           {audioIssue && "Звук не пошёл? Нажми «Перезапустить»"}
         </span>
       </div>
 
-      {(audioIssue || state === "error") && (
+      {(audioIssue || state === "error") && state !== "ended" && (
         <button
           type="button"
           onClick={resync}

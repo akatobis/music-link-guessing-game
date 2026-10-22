@@ -5,22 +5,12 @@ import type { GameStateRow } from "@/db/schema";
 
 export const GAME_STATE_ID = "main";
 export const COUNTDOWN_S = 5;
-export const WINDOW_S = 30;
+/** Safety cap: a round can never hang longer than this (track plays on). */
+export const MAX_ROUND_S = 480;
 export const REVEAL_S = 8;
+/** Speed bonus fades out over the first minute of the round. */
+export const SPEED_REF_MS = 60_000;
 export const ONLINE_WINDOW_MS = 12_000;
-
-export function secondsFor(status: string): number {
-  switch (status) {
-    case "countdown":
-      return COUNTDOWN_S;
-    case "playing":
-      return WINDOW_S;
-    case "reveal":
-      return REVEAL_S;
-    default:
-      return 0;
-  }
-}
 
 export async function getOrCreateState(): Promise<GameStateRow> {
   const [existing] = await db
@@ -60,7 +50,7 @@ export async function advanceIfNeeded(
       .update(gameState)
       .set({
         status: "playing",
-        phaseEndsAt: new Date(now.getTime() + WINDOW_S * 1000),
+        phaseEndsAt: new Date(now.getTime() + MAX_ROUND_S * 1000),
         updatedAt: now,
       })
       .where(
@@ -130,6 +120,7 @@ async function persistFinishedGame(st: GameStateRow) {
 
   const songMap = new Map(songRows.map((s) => [s.id, s]));
   const playerMap = new Map(playerRows.map((p) => [p.id, p]));
+  const ownerIndex = buildOwnerIndex(songRows);
 
   const [game] = await db
     .insert(games)
@@ -141,7 +132,13 @@ async function persistFinishedGame(st: GameStateRow) {
       const position = order.indexOf(a.songId);
       if (position < 0) return null;
       const song = songMap.get(a.songId);
-      const owner = song ? playerMap.get(song.playerId) : undefined;
+      const ownerIds = song
+        ? [...(ownerIndex.get(songKey(song)) ?? new Set([song.playerId]))]
+        : [];
+      const owners = ownerIds
+        .map((id) => playerMap.get(id))
+        .filter((p): p is NonNullable<typeof p> => Boolean(p));
+      const owner = owners[0];
       const guesser = playerMap.get(a.playerId);
       const guessed = a.guessedPlayerId
         ? playerMap.get(a.guessedPlayerId)
@@ -154,7 +151,10 @@ async function persistFinishedGame(st: GameStateRow) {
         songArtist: song?.artist ?? "",
         provider: song?.provider ?? "youtube",
         ownerId: owner?.id ?? null,
-        ownerName: owner?.name ?? "?",
+        ownerName:
+          owners.length > 1
+            ? owners.map((o) => o.name).join(" + ")
+            : (owner?.name ?? "?"),
         ownerColor: owner?.color ?? "#FF2E88",
         guesserId: guesser?.id ?? null,
         guesserName: guesser?.name ?? "?",
@@ -172,6 +172,28 @@ async function persistFinishedGame(st: GameStateRow) {
   }
 }
 
+/**
+ * Canonical identity of a track across players: the same YouTube video /
+ * Spotify track / Yandex track added by several people is ONE track.
+ */
+export function songKey(s: { provider: string; providerId: string }) {
+  return `${s.provider}:${s.providerId}`;
+}
+
+/** key -> set of player ids who added that track */
+export function buildOwnerIndex(
+  rows: { provider: string; providerId: string; playerId: string }[],
+) {
+  const map = new Map<string, Set<string>>();
+  for (const r of rows) {
+    const k = songKey(r);
+    const set = map.get(k) ?? new Set<string>();
+    set.add(r.playerId);
+    map.set(k, set);
+  }
+  return map;
+}
+
 export function shuffleArray<T>(arr: T[]): T[] {
   const a = [...arr];
   for (let i = a.length - 1; i > 0; i--) {
@@ -181,19 +203,90 @@ export function shuffleArray<T>(arr: T[]): T[] {
   return a;
 }
 
-/** Deterministic per-song playback offset (10–70% of duration). */
-export function snippetFraction(songId: string): number {
-  let h = 0;
-  for (let i = 0; i < songId.length; i++) {
-    h = (h * 31 + songId.charCodeAt(i)) >>> 0;
-  }
-  return 0.1 + (h % 60) / 100;
+export function pointsFor(elapsedMs: number, correct: boolean) {
+  if (!correct) return 0;
+  const t = Math.min(Math.max(elapsedMs, 0), SPEED_REF_MS);
+  return 100 + Math.round(50 * (1 - t / SPEED_REF_MS));
 }
 
-export function pointsFor(elapsedMs: number, windowMs: number, correct: boolean) {
-  if (!correct) return 0;
-  const t = Math.min(Math.max(elapsedMs, 0), windowMs);
-  return 100 + Math.round(50 * (1 - t / windowMs));
+/** Players expected to answer the current round: online, minus track owners. */
+export function eligibleAnswerers(
+  playerRows: { id: string; lastSeenAt: Date | null }[],
+  ownerIds: Set<string>,
+  nowMs: number,
+): string[] {
+  const online = playerRows.filter(
+    (p) =>
+      !ownerIds.has(p.id) &&
+      p.lastSeenAt &&
+      p.lastSeenAt.getTime() > nowMs - ONLINE_WINDOW_MS,
+  );
+  if (online.length > 0) return online.map((p) => p.id);
+  // Nobody is online right now — fall back to everyone who isn't an owner.
+  return playerRows.filter((p) => !ownerIds.has(p.id)).map((p) => p.id);
+}
+
+/** Owners of the round's track (same song added by several people). */
+export async function ownersOfSong(song: {
+  provider: string;
+  providerId: string;
+  playerId: string;
+}): Promise<Set<string>> {
+  const allSongs = await db.select().from(songs);
+  return (
+    buildOwnerIndex(allSongs).get(songKey(song)) ?? new Set([song.playerId])
+  );
+}
+
+/**
+ * Ends the listening phase as soon as every expected player has answered.
+ * Race-safe: the conditional UPDATE only succeeds once per round.
+ */
+export async function endRoundIfEveryoneAnswered(
+  st: GameStateRow,
+): Promise<GameStateRow> {
+  if (st.status !== "playing") return st;
+  const songId = st.roundOrder?.[st.roundIndex];
+  if (!songId) return st;
+
+  const [song] = await db.select().from(songs).where(eq(songs.id, songId));
+  if (!song) return st;
+
+  const owners = await ownersOfSong(song);
+  const playerRows = await db.select().from(players);
+  const nowMs = Date.now();
+  const expected = eligibleAnswerers(playerRows, owners, nowMs).length;
+  if (expected === 0) return st;
+
+  const answered = await db
+    .select({ id: liveAnswers.id })
+    .from(liveAnswers)
+    .where(eq(liveAnswers.songId, songId));
+  if (answered.length < expected) return st;
+
+  return forceReveal(st.roundIndex);
+}
+
+/** Moves the current round straight to the reveal phase. */
+export async function forceReveal(roundIndex: number): Promise<GameStateRow> {
+  const now = new Date();
+  const res = await db
+    .update(gameState)
+    .set({
+      status: "reveal",
+      phaseEndsAt: new Date(now.getTime() + REVEAL_S * 1000),
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(gameState.id, GAME_STATE_ID),
+        eq(gameState.status, "playing"),
+        eq(gameState.roundIndex, roundIndex),
+      ),
+    )
+    .returning();
+  if (res[0]) return res[0];
+  return getOrCreateState();
 }
 
 export type LiveStatus =

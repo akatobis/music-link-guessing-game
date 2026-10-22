@@ -2,7 +2,13 @@ import { NextResponse } from "next/server";
 import { and, eq } from "drizzle-orm";
 import { db } from "@/db";
 import { liveAnswers, players, songs } from "@/db/schema";
-import { getOrCreateState, pointsFor, WINDOW_S } from "@/lib/live";
+import {
+  endRoundIfEveryoneAnswered,
+  getOrCreateState,
+  ownersOfSong,
+  pointsFor,
+  MAX_ROUND_S,
+} from "@/lib/live";
 
 export const dynamic = "force-dynamic";
 
@@ -39,7 +45,11 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "no_player" }, { status: 404 });
   }
 
-  if (song.playerId === playerId) {
+  // The same track may have been added by several players — all of them are
+  // "owners": they can't answer, and naming any of them is correct.
+  const owners = await ownersOfSong(song);
+
+  if (owners.has(playerId)) {
     return NextResponse.json({ error: "own_song" }, { status: 403 });
   }
 
@@ -56,10 +66,10 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "already" }, { status: 409 });
   }
 
-  const startMs = st.phaseEndsAt.getTime() - WINDOW_S * 1000;
+  const startMs = st.phaseEndsAt.getTime() - MAX_ROUND_S * 1000;
   const elapsedMs = Math.max(0, nowMs - startMs);
-  const correct = guessedPlayerId === song.playerId;
-  const points = pointsFor(elapsedMs, WINDOW_S * 1000, correct);
+  const correct = owners.has(guessedPlayerId);
+  const points = pointsFor(elapsedMs, correct);
 
   await db.insert(liveAnswers).values({
     songId,
@@ -75,11 +85,15 @@ export async function POST(req: Request) {
     .from(liveAnswers)
     .where(eq(liveAnswers.songId, songId));
 
+  // Everyone answered? Then stop the music early and reveal.
+  const after = await endRoundIfEveryoneAnswered(st);
+
   return NextResponse.json({
     ok: true,
     correct,
     points,
     elapsedMs: Math.round(elapsedMs),
     answersCount: count.length,
+    roundClosed: after.status === "reveal",
   });
 }

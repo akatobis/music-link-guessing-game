@@ -99,6 +99,5 @@ export const PROVIDER_META: Record<
   },
 };
 
-export const SNIPPET_SECONDS = 25;
 export const MAX_SONGS_PER_PLAYER = 10;
 export const MAX_PLAYERS = 12;

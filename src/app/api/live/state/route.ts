@@ -4,10 +4,13 @@ import { db } from "@/db";
 import { liveAnswers, players, songs } from "@/db/schema";
 import {
   advanceIfNeeded,
+  buildOwnerIndex,
+  eligibleAnswerers,
+  endRoundIfEveryoneAnswered,
   getOrCreateState,
-  snippetFraction,
+  songKey,
   COUNTDOWN_S,
-  WINDOW_S,
+  MAX_ROUND_S,
   REVEAL_S,
   ONLINE_WINDOW_MS,
 } from "@/lib/live";
@@ -29,6 +32,9 @@ export async function GET(req: Request) {
 
   let st = await getOrCreateState();
   st = await advanceIfNeeded(st);
+  // Also closes the round when the last expected answer lands (or when the
+  // only player left to answer went offline).
+  st = await endRoundIfEveryoneAnswered(st);
 
   const nowMs = Date.now();
   const playerRows = await db
@@ -59,7 +65,7 @@ export async function GET(req: Request) {
     totalRounds: st.totalRounds,
     phaseEndsAt: st.phaseEndsAt?.getTime() ?? null,
     countdownS: COUNTDOWN_S,
-    windowS: WINDOW_S,
+    maxRoundS: MAX_ROUND_S,
     revealS: REVEAL_S,
     scores,
     players: playerRows.map((p) => ({ id: p.id, name: p.name, color: p.color })),
@@ -72,7 +78,6 @@ export async function GET(req: Request) {
       providerId: string;
       albumId: string | null;
       embedUrl: string;
-      fraction: number;
     },
     songInfo: null as null | {
       title: string;
@@ -81,6 +86,7 @@ export async function GET(req: Request) {
       ownerId: string;
       ownerName: string;
       ownerColor: string;
+      owners: { id: string; name: string; color: string }[];
     },
     isOwner: false,
     myAnswer: null as null | {
@@ -119,7 +125,17 @@ export async function GET(req: Request) {
 
   const roundAnswers = answerRows.filter((a) => a.songId === songId);
   const mine = roundAnswers.find((a) => a.playerId === playerId);
-  const owner = playerMap.get(song.playerId);
+
+  // All players who added this exact track share ownership of the round.
+  const allSongs = await db.select().from(songs);
+  const ownerIds = [
+    ...(buildOwnerIndex(allSongs).get(songKey(song)) ??
+      new Set([song.playerId])),
+  ];
+  const owners = ownerIds
+    .map((id) => playerMap.get(id))
+    .filter((p): p is NonNullable<typeof p> => Boolean(p));
+  const owner = owners[0];
 
   base.song = {
     id: song.id,
@@ -127,11 +143,14 @@ export async function GET(req: Request) {
     providerId: song.providerId,
     albumId: song.albumId,
     embedUrl: song.embedUrl,
-    fraction: snippetFraction(song.id),
   };
-  base.isOwner = song.playerId === playerId;
+  base.isOwner = ownerIds.includes(playerId);
   base.answersCount = roundAnswers.length;
-  base.eligible = Math.max(playerRows.length - 1, 1);
+  base.eligible = eligibleAnswerers(
+    playerRows,
+    new Set(ownerIds),
+    nowMs,
+  ).length;
   base.myAnswer = mine
     ? {
         guessedPlayerId: mine.guessedPlayerId,
@@ -149,6 +168,7 @@ export async function GET(req: Request) {
       ownerId: song.playerId,
       ownerName: owner?.name ?? "?",
       ownerColor: owner?.color ?? "#FF2E88",
+      owners: owners.map((o) => ({ id: o.id, name: o.name, color: o.color })),
     };
     base.guesses = roundAnswers
       .map((a) => {
